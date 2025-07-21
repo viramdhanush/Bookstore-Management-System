@@ -1,0 +1,207 @@
+// === FILE: server.js ===
+const express = require('express');
+const mongoose = require('mongoose');
+const dotenv = require('dotenv');
+const cors = require('cors');
+const authRoutes = require('./routes/auth');
+const bookRoutes = require('./routes/books');
+const orderRoutes = require('./routes/orders');
+const { errorHandler } = require('./middleware/error');
+
+dotenv.config();
+const app = express();
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// Routes
+app.use('/api', authRoutes);
+app.use('/api/books', bookRoutes);
+app.use('/api/orders', orderRoutes);
+
+// Error handling
+app.use(errorHandler);
+
+// Connect DB and start server
+mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+  .then(() => app.listen(process.env.PORT || 5000))
+  .catch(err => console.error(err));
+
+
+// === FILE: models/User.js ===
+const mongoose = require('mongoose');
+const bcrypt = require('bcrypt');
+
+const UserSchema = new mongoose.Schema({
+  name: String,
+  email: { type: String, unique: true },
+  password: String,
+  role: { type: String, enum: ['customer', 'admin'], default: 'customer' },
+});
+
+UserSchema.pre('save', async function () {
+  if (this.isModified('password')) {
+    this.password = await bcrypt.hash(this.password, 10);
+  }
+});
+
+module.exports = mongoose.model('User', UserSchema);
+
+
+// === FILE: models/Book.js ===
+const mongoose = require('mongoose');
+
+const BookSchema = new mongoose.Schema({
+  title: String,
+  author: String,
+  genre: String,
+  ISBN: String,
+  price: Number,
+  stock: Number,
+  description: String,
+  imageUrl: String,
+});
+
+module.exports = mongoose.model('Book', BookSchema);
+
+
+// === FILE: models/Order.js ===
+const mongoose = require('mongoose');
+
+const OrderSchema = new mongoose.Schema({
+  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  books: [
+    {
+      book: { type: mongoose.Schema.Types.ObjectId, ref: 'Book' },
+      quantity: Number,
+    },
+  ],
+  totalPrice: Number,
+  status: { type: String, enum: ['pending', 'shipped', 'delivered'], default: 'pending' },
+  paymentStatus: { type: String, enum: ['unpaid', 'paid'], default: 'unpaid' },
+});
+
+module.exports = mongoose.model('Order', OrderSchema);
+
+
+// === FILE: middleware/auth.js ===
+const jwt = require('jsonwebtoken');
+
+exports.verifyToken = (req, res, next) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ message: 'Unauthorized' });
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    res.status(403).json({ message: 'Invalid token' });
+  }
+};
+
+exports.isAdmin = (req, res, next) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ message: 'Access denied' });
+  next();
+};
+
+
+// === FILE: middleware/error.js ===
+exports.errorHandler = (err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ message: 'Internal server error' });
+};
+
+
+// === FILE: routes/auth.js ===
+const router = require('express').Router();
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcrypt');
+const User = require('../models/User');
+
+router.post('/register', async (req, res) => {
+  const { name, email, password } = req.body;
+  const user = new User({ name, email, password });
+  await user.save();
+  res.status(201).json({ message: 'User registered' });
+});
+
+router.post('/login', async (req, res) => {
+  const { email, password } = req.body;
+  const user = await User.findOne({ email });
+  if (!user || !(await bcrypt.compare(password, user.password))) {
+    return res.status(401).json({ message: 'Invalid credentials' });
+  }
+  const token = jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET);
+  res.json({ token });
+});
+
+module.exports = router;
+
+
+// === FILE: routes/books.js ===
+const router = require('express').Router();
+const Book = require('../models/Book');
+const { verifyToken, isAdmin } = require('../middleware/auth');
+
+router.get('/', async (req, res) => {
+  const { search, genre, author } = req.query;
+  const query = {};
+  if (search) query.title = { $regex: search, $options: 'i' };
+  if (genre) query.genre = genre;
+  if (author) query.author = author;
+  const books = await Book.find(query);
+  res.json(books);
+});
+
+router.get('/:id', async (req, res) => {
+  const book = await Book.findById(req.params.id);
+  res.json(book);
+});
+
+router.post('/', verifyToken, isAdmin, async (req, res) => {
+  const book = new Book(req.body);
+  await book.save();
+  res.status(201).json(book);
+});
+
+router.put('/:id', verifyToken, isAdmin, async (req, res) => {
+  const book = await Book.findByIdAndUpdate(req.params.id, req.body, { new: true });
+  res.json(book);
+});
+
+router.delete('/:id', verifyToken, isAdmin, async (req, res) => {
+  await Book.findByIdAndDelete(req.params.id);
+  res.status(204).send();
+});
+
+module.exports = router;
+
+
+// === FILE: routes/orders.js ===
+const router = require('express').Router();
+const Order = require('../models/Order');
+const { verifyToken, isAdmin } = require('../middleware/auth');
+
+router.get('/', verifyToken, isAdmin, async (req, res) => {
+  const orders = await Order.find().populate('user books.book');
+  res.json(orders);
+});
+
+router.get('/:id', verifyToken, async (req, res) => {
+  const order = await Order.findById(req.params.id).populate('books.book');
+  res.json(order);
+});
+
+router.post('/', verifyToken, async (req, res) => {
+  const order = new Order({ ...req.body, user: req.user.id });
+  await order.save();
+  res.status(201).json(order);
+});
+
+router.put('/:id/status', verifyToken, isAdmin, async (req, res) => {
+  const order = await Order.findByIdAndUpdate(req.params.id, { status: req.body.status }, { new: true });
+  res.json(order);
+});
+
+module.exports = router;
